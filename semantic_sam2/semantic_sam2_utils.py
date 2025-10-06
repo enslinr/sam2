@@ -76,6 +76,8 @@ def load_checkpoint_staged_safe(model, ckpt_path: Optional[str]):
                 return checkpoint["model_state_dict"]
             elif "model" in checkpoint:
                 return checkpoint["model"]
+            elif "model_state" in checkpoint:
+                return checkpoint["model_state"]
             else:
                 # Assume the dict itself is the state dict
                 return checkpoint
