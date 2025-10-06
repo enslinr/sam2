@@ -396,7 +396,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=4, help="Data loader worker threads.")
     parser.add_argument("--amp", default=False, action="store_true", help="Enable mixed-precision training if CUDA is available.")
     parser.add_argument("--freeze-image-encoder", default=True, action="store_true", help="Freeze all parameters in the image encoder during fine-tuning.")
-    parser.add_argument("--grad-clip", type=float, default=0.0, help="Gradient norm clip value (0 disables clipping).")
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient norm clip value (0 disables clipping).")
     parser.add_argument("--lr-scheduler", choices=["none", "cosine"], default="none", help="Learning rate schedule.")
     parser.add_argument("--output-dir", type=Path, default=Path("semantic_sam2_runs"), help="Directory to store checkpoints.")
     parser.add_argument("--ignore-index", type=int, default=-1, help="Ignore index value used in the masks.")
