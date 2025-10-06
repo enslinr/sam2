@@ -32,12 +32,6 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
-GLOBAL_bb_feat_sizes = [
-    (256, 256),
-    (128, 128),
-    (64, 64),
-]
-
 
 def freeze_image_encoder_parameters(model):
     base_model = model.module if hasattr(model, 'module') else model
@@ -193,7 +187,6 @@ class SegmentationMetrics:
     def __init__(self, num_classes: int, ignore_index: Optional[int] = None) -> None:
         self.num_classes = num_classes
         self.ignore_index = ignore_index
-        # Spatial dim for backbone feature maps
         self.reset()
 
     def reset(self) -> None:
@@ -243,64 +236,17 @@ def forward_semantic_logits(model: torch.nn.Module, images: torch.Tensor) -> tor
     """Run the Semantic SAM2 model and return per-class logits."""
     backbone_out = model.forward_image(images)
     _, vision_feats, _, feat_sizes = model._prepare_backbone_features(backbone_out)
-    vision_feats[-1] = vision_feats[-1] + model.no_mem_embed
     batch_size = images.size(0)
-
-    feats = [
-        feat.permute(1, 2, 0).view(batch_size, -1, *feat_size)
-        for feat, feat_size in zip(vision_feats[::-1], GLOBAL_bb_feat_sizes[::-1])
-    ][::-1]
-
-    image_embedding = feats[-1]
-    high_res_feats = feats[:-1]
-
-    point_coords=None
-    point_labels=None
-    box=None
-
-
-    num_images = len(image_embedding)
-    all_masks = []
-    all_ious = []
-    all_low_res_masks = []
-    for img_idx in range(num_images):
-
-        sparse_embeddings, dense_embeddings = model.sam_prompt_encoder(
-            points=point_coords,
-            boxes=None,
-            masks=None,
-        )
-
+    if len(vision_feats) > 1:
         high_res_features = [
-            feat_level[img_idx].unsqueeze(0)
-            for feat_level in high_res_feats
+            feat.permute(1, 2, 0).reshape(batch_size, feat.size(2), *size)
+            for feat, size in zip(vision_feats[:-1], feat_sizes[:-1])
         ]
-
-
-        low_res_masks, iou_predictions, _, _ = model.sam_mask_decoder(
-            image_embeddings=image_embedding[img_idx].unsqueeze(0),
-            image_pe=model.sam_prompt_encoder.get_dense_pe(),
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            multimask_output=False,
-            repeat_image=True,
-            high_res_features=high_res_features,
-        )
-
-        masks = self._transforms.postprocess_masks(
-            low_res_masks, self._orig_hw[img_idx]
-        )
-
-    # if len(vision_feats) > 1:
-    #     high_res_features = [
-    #         feat.permute(1, 2, 0).reshape(batch_size, feat.size(2), *size)
-    #         for feat, size in zip(vision_feats[:-1], feat_sizes[:-1])
-    #     ]
-    # else:
-    #     high_res_features = None
-    # fused_features = vision_feats[-1].permute(1, 2, 0).reshape(
-    #     batch_size, vision_feats[-1].size(2), *feat_sizes[-1]
-    # )
+    else:
+        high_res_features = None
+    fused_features = vision_feats[-1].permute(1, 2, 0).reshape(
+        batch_size, vision_feats[-1].size(2), *feat_sizes[-1]
+    )
     sam_outputs = model._forward_sam_heads(
         backbone_features=fused_features,
         point_inputs=None,
@@ -439,27 +385,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-images", type=Path, default=Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\val\img_stretched"), help="Directory with validation images.")
     parser.add_argument("--val-masks", type=Path, default=Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\val\mask_stretched"), help="Directory with validation masks.")
     parser.add_argument("--config-file", type=str, default="configs/sam2.1/sam2.1_hiera_b+.yaml", help="Hydra config name for the backbone (e.g. configs/sam2.1/sam2.1_hiera_b+.yaml).")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Optional checkpoint path to initialize the model.")
+    parser.add_argument("--checkpoint", type=str, default=root_dir/"checkpoints/sam2.1_hiera_base_plus.pt", help="Optional checkpoint path to initialize the model.")
     parser.add_argument("--num-classes", type=int, default=9, help="Number of semantic classes (including background).")
-    parser.add_argument("--use-safe-checkpoint", action="store_true", help="Use staged checkpoint loading to adapt mismatched decoders.")
+    parser.add_argument("--use-safe-checkpoint", default=True, action="store_true", help="Use staged checkpoint loading to adapt mismatched decoders.")
     parser.add_argument("--device", type=str, default="cuda", help="Torch device to use (e.g. cuda, cuda:0, cpu).")
     parser.add_argument("--epochs", type=int, default=25, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size per step.")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="AdamW weight decay.")
     parser.add_argument("--num-workers", type=int, default=4, help="Data loader worker threads.")
-    parser.add_argument("--amp", action="store_true", help="Enable mixed-precision training if CUDA is available.")
+    parser.add_argument("--amp", default=False, action="store_true", help="Enable mixed-precision training if CUDA is available.")
     parser.add_argument("--freeze-image-encoder", default=True, action="store_true", help="Freeze all parameters in the image encoder during fine-tuning.")
     parser.add_argument("--grad-clip", type=float, default=0.0, help="Gradient norm clip value (0 disables clipping).")
     parser.add_argument("--lr-scheduler", choices=["none", "cosine"], default="none", help="Learning rate schedule.")
     parser.add_argument("--output-dir", type=Path, default=Path("semantic_sam2_runs"), help="Directory to store checkpoints.")
-    parser.add_argument("--ignore-index", type=int, default=255, help="Ignore index value used in the masks.")
-    parser.add_argument("--augment", action="store_true", help="Enable simple flip augmentations.")
+    parser.add_argument("--ignore-index", type=int, default=-1, help="Ignore index value used in the masks.")
+    parser.add_argument("--augment", default=True, action="store_true", help="Enable simple flip augmentations.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--deterministic", action="store_true", help="Enable deterministic training (may reduce throughput).")
     parser.add_argument("--wandb-project", type=str, default="semantic-sam2", help="Weights & Biases project name.")
     parser.add_argument("--wandb-run-name", type=str, default="test_sam_2", help="Optional W&B run name override.")
-    parser.add_argument("--disable-wandb", action="store_true", help="Disable W&B logging.")
+    parser.add_argument("--disable-wandb", default=False, action="store_true", help="Disable W&B logging.")
     return parser.parse_args()
 
 
