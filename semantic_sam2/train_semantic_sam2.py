@@ -22,10 +22,20 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import torchvision.transforms.functional as TF
 from PIL import Image
+import matplotlib.pyplot as plt
 
 from setup_imports import root_dir
 from semantic_sam2.build_semantic_sam2 import build_semantic_sam2
 from semantic_sam2.wandb_wrapper import create_wandb_wrapper
+from semantic_sam2.visualization_utils import (
+    create_training_visualizer,
+    visualize_from_probabilities,
+)
+
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
@@ -194,6 +204,8 @@ class SegmentationMetrics:
         self.total_pixels = 0.0
         self.intersections = np.zeros(self.num_classes, dtype=np.float64)
         self.unions = np.zeros(self.num_classes, dtype=np.float64)
+        self.pred_pixels = np.zeros(self.num_classes, dtype=np.float64)
+        self.target_pixels = np.zeros(self.num_classes, dtype=np.float64)
 
     def update(self, logits: torch.Tensor, targets: torch.Tensor) -> None:
         logits = logits.detach()
@@ -212,23 +224,67 @@ class SegmentationMetrics:
             pred_c = (preds == class_idx) & valid
             target_c = (targets == class_idx) & valid
             intersection = torch.logical_and(pred_c, target_c).sum().item()
-            union = pred_c.sum().item() + target_c.sum().item() - intersection
+            pred_sum = pred_c.sum().item()
+            target_sum = target_c.sum().item()
+            union = pred_sum + target_sum - intersection
             self.intersections[class_idx] += intersection
             self.unions[class_idx] += union
+            self.pred_pixels[class_idx] += pred_sum
+            self.target_pixels[class_idx] += target_sum
 
     def compute(self) -> Dict[str, float]:
         pixel_acc = (
             self.total_correct / self.total_pixels if self.total_pixels > 0 else 0.0
         )
-        per_class = {}
+        per_class_iou = {}
+        per_class_dice = {}
+        iou_values = []
+        dice_values = []
+        iou_values_excl_bg = []
+        dice_values_excl_bg = []
         for class_idx in range(self.num_classes):
+            intersection = self.intersections[class_idx]
             union = self.unions[class_idx]
-            if union > 0:
-                per_class[f"class_{class_idx}"] = self.intersections[class_idx] / union
-        mean_iou = float(np.mean(list(per_class.values()))) if per_class else 0.0
-        metrics = {"pixel_acc": float(pixel_acc), "mean_iou": mean_iou}
-        for key, value in per_class.items():
-            metrics[f"{key}_iou"] = float(value)
+            pred_sum = self.pred_pixels[class_idx]
+            target_sum = self.target_pixels[class_idx]
+
+            if union == 0 and pred_sum == 0 and target_sum == 0:
+                iou = 1.0
+            elif union > 0:
+                iou = intersection / union
+            else:
+                iou = 0.0
+
+            denom = pred_sum + target_sum
+            if denom == 0:
+                dice = 1.0
+            else:
+                dice = (2.0 * intersection) / denom
+
+            per_class_iou[f"class_{class_idx}_iou"] = float(iou)
+            per_class_dice[f"class_{class_idx}_dice"] = float(dice)
+            iou_values.append(iou)
+            dice_values.append(dice)
+            if class_idx != 0:
+                iou_values_excl_bg.append(iou)
+                dice_values_excl_bg.append(dice)
+
+        mean_iou = float(np.mean(iou_values)) if iou_values else 0.0
+        mean_dice = float(np.mean(dice_values)) if dice_values else 0.0
+        mean_iou_excl_bg = float(np.mean(iou_values_excl_bg)) if iou_values_excl_bg else mean_iou
+        mean_dice_excl_bg = float(np.mean(dice_values_excl_bg)) if dice_values_excl_bg else mean_dice
+
+        metrics = {
+            "pixel_acc": float(pixel_acc),
+            "iou_score": mean_iou,
+            "iou_score_exclB": mean_iou_excl_bg,
+            "dice_score": mean_dice,
+            "dice_score_exclB": mean_dice_excl_bg,
+            "mean_iou": mean_iou,
+            "mean_dice": mean_dice,
+        }
+        metrics.update(per_class_iou)
+        metrics.update(per_class_dice)
         return metrics
 
 
@@ -306,6 +362,8 @@ def train_one_epoch(
 
     avg_loss = running_loss / max(num_samples, 1)
     metrics = metric_tracker.compute()
+    metrics["total_loss"] = float(running_loss)
+    metrics["avg_loss"] = float(avg_loss)
     metrics["loss"] = float(avg_loss)
     return metrics
 
@@ -338,6 +396,8 @@ def evaluate(
 
     avg_loss = running_loss / max(num_samples, 1)
     metrics = metric_tracker.compute()
+    metrics["total_loss"] = float(running_loss)
+    metrics["avg_loss"] = float(avg_loss)
     metrics["loss"] = float(avg_loss)
     model.train()
     return metrics
@@ -353,6 +413,65 @@ def flatten_metrics(prefix: str, metrics: Dict[str, float]) -> Dict[str, float]:
             continue
         flat[f"{prefix}/{key}"] = numeric
     return flat
+
+
+@torch.no_grad()
+def visualize_predictions(
+    model: torch.nn.Module,
+    dataset: Dataset,
+    device: torch.device,
+    visualizer,
+    wandb_wrapper,
+    epoch: int,
+    output_dir: Path,
+    num_samples: int = 3,
+) -> None:
+    """Render a few validation predictions and log/save the figures."""
+    if visualizer is None or len(dataset) == 0 or num_samples <= 0:
+        return
+
+    viz_dir = output_dir / f"visualizations_epoch_{epoch:04d}"
+    viz_dir.mkdir(parents=True, exist_ok=True)
+
+    model_was_training = model.training
+    model.eval()
+
+    try:
+        total = min(num_samples, len(dataset))
+        for sample_idx in range(total):
+            sample = dataset[sample_idx]
+            image = sample["image"].unsqueeze(0).to(device, non_blocking=True)
+            logits = forward_semantic_logits(model, image)
+            probs = torch.softmax(logits, dim=1)[0].cpu()
+            target_mask = sample["mask"].cpu()
+
+            fig, iou_scores = visualize_from_probabilities(
+                pred_probs=probs,
+                target_mask=target_mask,
+                visualizer=visualizer,
+                title=f"Validation Sample {sample_idx}",
+                epoch=epoch,
+                use_argmax=True,
+            )
+
+            source_name = Path(sample.get("image_path", f"val_{sample_idx}")).stem
+            if wandb_wrapper is not None:
+                wandb_wrapper.log_figure_with_metrics(
+                    prefix="val_visualization",
+                    source_idx=sample_idx,
+                    source_name=source_name,
+                    epoch=epoch,
+                    fig=fig,
+                    iou_scores=iou_scores,
+                    close_figure=False,
+                )
+
+            out_path = viz_dir / f"{source_name}_epoch{epoch:04d}.png"
+            fig.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+    finally:
+        if model_was_training:
+            model.train()
 
 
 def save_checkpoint(
@@ -403,7 +522,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--augment", default=True, action="store_true", help="Enable simple flip augmentations.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--deterministic", action="store_true", help="Enable deterministic training (may reduce throughput).")
-    parser.add_argument("--wandb-project", type=str, default="semantic-sam2", help="Weights & Biases project name.")
+    parser.add_argument("--wandb-project", type=str, default="sam2_NR206", help="Weights & Biases project name.")
     parser.add_argument("--wandb-run-name", type=str, default="test_sam_2", help="Optional W&B run name override.")
     parser.add_argument("--disable-wandb", default=False, action="store_true", help="Disable W&B logging.")
     return parser.parse_args()
@@ -526,6 +645,8 @@ def main() -> None:
             wandb_kwargs["name"] = args.wandb_run_name
         wandb_wrapper.init(project=args.wandb_project, config=wandb_config, **wandb_kwargs)
 
+    visualizer = create_training_visualizer(device=str(device), include_background_as_class=True)
+
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -575,10 +696,27 @@ def main() -> None:
 
             log_payload = flatten_metrics("train", train_metrics)
             log_payload.update(flatten_metrics("val", val_metrics))
+            for split_name, split_metrics in (("train", train_metrics), ("val", val_metrics)):
+                for metric_name, metric_value in split_metrics.items():
+                    try:
+                        numeric_value = float(metric_value)
+                    except (TypeError, ValueError):
+                        continue
+                    log_payload[f"{split_name}_{metric_name}"] = numeric_value
             log_payload["epoch"] = float(epoch)
             log_payload["lr"] = float(optimizer.param_groups[0]["lr"])
             if wandb_wrapper.enabled:
                 wandb_wrapper.log(log_payload, step=epoch)
+
+            visualize_predictions(
+                model=model,
+                dataset=val_dataset,
+                device=device,
+                visualizer=visualizer,
+                wandb_wrapper=wandb_wrapper,
+                epoch=epoch,
+                output_dir=output_dir,
+            )
 
             current_metric = val_metrics.get("mean_iou", 0.0)
             is_best = current_metric > best_metric
