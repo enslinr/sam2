@@ -11,6 +11,7 @@ index value (e.g., 255).
 import argparse
 import logging
 import random
+import inspect
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -23,6 +24,9 @@ from tqdm import tqdm
 import torchvision.transforms.functional as TF
 from PIL import Image
 import matplotlib.pyplot as plt
+import cv2
+
+import albumentations as A
 
 from setup_imports import root_dir
 from semantic_sam2.build_semantic_sam2 import build_semantic_sam2
@@ -137,6 +141,7 @@ class PairedImageMaskDataset(Dataset):
         self.num_classes = num_classes
         self.ignore_index = ignore_index
         self.augment = augment
+        self.augmentations = self._build_augmentations() if augment else None
         resampling = getattr(Image, 'Resampling', None)
         if resampling is not None:
             self._image_resample = resampling.BILINEAR
@@ -148,18 +153,70 @@ class PairedImageMaskDataset(Dataset):
     def __len__(self) -> int:
         return len(self.pairs)
 
+    def _build_augmentations(self):
+        rotate_kwargs = {
+            "limit": (-5, 5),
+            "interpolation": cv2.INTER_LINEAR,
+            "border_mode": cv2.BORDER_CONSTANT,
+            "crop_border": False,
+            "mask_interpolation": cv2.INTER_NEAREST,
+            "fill": 0,
+            "fill_mask": 0,
+            "p": 0.8,
+        }
+        if "rotate_method" in inspect.signature(A.Rotate.__init__).parameters:
+            rotate_kwargs["rotate_method"] = "ellipse"
+
+        transforms = [A.HorizontalFlip(p=0.8), A.Rotate(**rotate_kwargs)]
+
+
+        transforms.append(
+            A.AdvancedBlur(
+                blur_limit=[3, 7],
+                sigma_x_limit=[0.2, 1],
+                sigma_y_limit=[0.2, 1],
+                rotate_limit=[-90, 90],
+                beta_limit=[0.5, 8],
+                noise_limit=[0.9, 1.1],
+                p=0.8,
+            )
+        )
+
+
+        transforms.append(
+            A.ColorJitter(
+                brightness=[0.8, 1.2],
+                contrast=[0.8, 1.2],
+                saturation=[0.8, 1.2],
+                hue=[-0.5, 0.5],
+                p=0.8,
+            )
+        )
+
+        try:
+            return A.Compose(transforms)
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.warning(
+                "Failed to initialize Albumentations pipeline (%s); using simple flip augmentations instead.",
+                exc,
+            )
+            return None
+
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         image_path, mask_path = self.pairs[index]
         image = Image.open(image_path).convert("RGB")
         mask = Image.open(mask_path)
 
-        if self.augment:
-            if random.random() < 0.5:
-                image = TF.hflip(image)
-                mask = TF.hflip(mask)
-            if random.random() < 0.5:
-                image = TF.vflip(image)
-                mask = TF.vflip(mask)
+        if self.augmentations is not None:
+            image_np = np.array(image)
+            mask_np = np.array(mask, dtype=np.uint8)
+            augmented = self.augmentations(image=image_np, mask=mask_np)
+            image_aug = augmented["image"]
+            mask_aug = augmented["mask"]
+            if mask_aug.dtype != np.uint8:
+                mask_aug = mask_aug.astype(np.uint8)
+            image = Image.fromarray(image_aug)
+            mask = Image.fromarray(mask_aug)
 
         mask = mask.resize((self.image_size, self.image_size), resample=self._mask_resample)
         mask_array = np.array(mask, dtype=np.int64)
@@ -504,7 +561,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-images", type=Path, default=Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\val\img_stretched"), help="Directory with validation images.")
     parser.add_argument("--val-masks", type=Path, default=Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\val\mask_stretched"), help="Directory with validation masks.")
     parser.add_argument("--config-file", type=str, default="configs/sam2.1/sam2.1_hiera_b+.yaml", help="Hydra config name for the backbone (e.g. configs/sam2.1/sam2.1_hiera_b+.yaml).")
-    parser.add_argument("--checkpoint", type=str, default=root_dir/"checkpoints/sam2.1_hiera_base_plus.pt", help="Optional checkpoint path to initialize the model.")
+    parser.add_argument("--checkpoint", type=str, default=root_dir/"semantic_sam2/training_checkpoints/FIE_best.pt", help="Optional checkpoint path to initialize the model.")
     parser.add_argument("--num-classes", type=int, default=9, help="Number of semantic classes (including background).")
     parser.add_argument("--use-safe-checkpoint", default=True, action="store_true", help="Use staged checkpoint loading to adapt mismatched decoders.")
     parser.add_argument("--device", type=str, default="cuda", help="Torch device to use (e.g. cuda, cuda:0, cpu).")
@@ -523,8 +580,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--deterministic", action="store_true", help="Enable deterministic training (may reduce throughput).")
     parser.add_argument("--wandb-project", type=str, default="sam2_NR206", help="Weights & Biases project name.")
-    parser.add_argument("--wandb-run-name", type=str, default="test_sam_2", help="Optional W&B run name override.")
-    parser.add_argument("--disable-wandb", default=False, action="store_true", help="Disable W&B logging.")
+    parser.add_argument("--wandb-run-name", type=str, default="local_test", help="Optional W&B run name override.")
+    parser.add_argument("--disable-wandb", default=True, action="store_true", help="Disable W&B logging.")
     return parser.parse_args()
 
 

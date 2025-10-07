@@ -10,3 +10,8 @@ outputs/*
 checkpoints/*.pt
 demo/backend/checkpoints/*.pt
 *.pt
+.env
+*.png
+*.log
+wandb/*
+semantic_sam2_runs/*
