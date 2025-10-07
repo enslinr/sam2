@@ -221,20 +221,20 @@ class SemanticMaskDecoder(MaskDecoder):
         if not self.use_high_res_features:
             upscaled_embedding = self.output_upscaling(src)
         else:
-            # dc1, ln1, act1, dc2, act2 = self.output_upscaling
-            # feat_s0, feat_s1 = high_res_features
-            # upscaled_embedding = act1(ln1(dc1(src) + feat_s1))
-            # upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
-
             dc1, ln1, act1, dc2, act2 = self.output_upscaling
             feat_s0, feat_s1 = high_res_features
-            upscaled_embedding = dc1(src)
-            upscaled_embedding = ln1(upscaled_embedding + feat_s1)
-            upscaled_embedding = act1(upscaled_embedding)
-            upscaled_embedding = dc2(upscaled_embedding)
-            fusion = self.upscale_residual_proj(upscaled_embedding) + feat_s0
-            fusion = act2(fusion)
-            upscaled_embedding = self.upscale_post_add_proj(fusion)
+            upscaled_embedding = act1(ln1(dc1(src) + feat_s1))
+            upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
+
+            # dc1, ln1, act1, dc2, act2 = self.output_upscaling
+            # feat_s0, feat_s1 = high_res_features
+            # upscaled_embedding = dc1(src)
+            # upscaled_embedding = ln1(upscaled_embedding + feat_s1)
+            # upscaled_embedding = act1(upscaled_embedding)
+            # upscaled_embedding = dc2(upscaled_embedding)
+            # fusion = self.upscale_residual_proj(upscaled_embedding) + feat_s0
+            # fusion = act2(fusion)
+            # upscaled_embedding = self.upscale_post_add_proj(fusion)
 
         hyper_in_list: List[torch.Tensor] = []
         for i in range(self.num_mask_tokens):
