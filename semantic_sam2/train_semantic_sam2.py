@@ -610,7 +610,7 @@ def main() -> None:
         "++model.pred_obj_scores=false",
         "++model.pred_obj_scores_mlp=false",
         "++model.fixed_no_obj_ptr=false",
-        "++model.sam_mask_decoder_extra_args.hypernet_output_dim=64",
+        # "++model.sam_mask_decoder_extra_args.hypernet_output_dim=64",
     ]
 
     logging.info("Building Semantic SAM2 model from config '%s'", args.config_file)
