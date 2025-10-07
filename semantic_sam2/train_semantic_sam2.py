@@ -351,6 +351,7 @@ def forward_semantic_logits(model: torch.nn.Module, images: torch.Tensor) -> tor
     _, vision_feats, _, feat_sizes = model._prepare_backbone_features(backbone_out)
     batch_size = images.size(0)
     if len(vision_feats) > 1:
+        vision_feats[-1] = vision_feats[-1] + model.no_mem_embed
         high_res_features = [
             feat.permute(1, 2, 0).reshape(batch_size, feat.size(2), *size)
             for feat, size in zip(vision_feats[:-1], feat_sizes[:-1])
@@ -604,6 +605,10 @@ def main() -> None:
         f"++model.num_classes={args.num_classes}",
         "++model.num_maskmem=0",
         "++model.use_mask_input_as_output_without_sam=false",
+        "++model.multimask_output_in_sam=false",
+        "++model.pred_obj_scores=false",
+        "++model.pred_obj_scores_mlp=false",
+        "++model.fixed_no_obj_ptr=false",
     ]
 
     logging.info("Building Semantic SAM2 model from config '%s'", args.config_file)
