@@ -562,13 +562,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-images", type=Path, default=Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\val\img_stretched"), help="Directory with validation images.")
     parser.add_argument("--val-masks", type=Path, default=Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\val\mask_stretched"), help="Directory with validation masks.")
     parser.add_argument("--config-file", type=str, default="configs/sam2.1/sam2.1_hiera_b+.yaml", help="Hydra config name for the backbone (e.g. configs/sam2.1/sam2.1_hiera_b+.yaml).")
-    parser.add_argument("--checkpoint", type=str, default=root_dir/"semantic_sam2/training_checkpoints/FIE_best.pt", help="Optional checkpoint path to initialize the model.")
+    parser.add_argument("--checkpoint", type=str, default=root_dir/"checkpoints/sam2.1_hiera_base_plus.pt", help="Optional checkpoint path to initialize the model.")
+    # parser.add_argument("--checkpoint", type=str, default=root_dir/"semantic_sam2/training_checkpoints/FIE_best.pt", help="Optional checkpoint path to initialize the model.")
     parser.add_argument("--num-classes", type=int, default=9, help="Number of semantic classes (including background).")
     parser.add_argument("--use-safe-checkpoint", default=True, action="store_true", help="Use staged checkpoint loading to adapt mismatched decoders.")
     parser.add_argument("--device", type=str, default="cuda", help="Torch device to use (e.g. cuda, cuda:0, cpu).")
     parser.add_argument("--epochs", type=int, default=25, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size per step.")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate.")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="AdamW weight decay.")
     parser.add_argument("--num-workers", type=int, default=4, help="Data loader worker threads.")
     parser.add_argument("--amp", default=False, action="store_true", help="Enable mixed-precision training if CUDA is available.")
@@ -609,6 +610,7 @@ def main() -> None:
         "++model.pred_obj_scores=false",
         "++model.pred_obj_scores_mlp=false",
         "++model.fixed_no_obj_ptr=false",
+        "++model.sam_mask_decoder_extra_args.hypernet_output_dim=64",
     ]
 
     logging.info("Building Semantic SAM2 model from config '%s'", args.config_file)
