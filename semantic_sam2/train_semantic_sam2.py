@@ -12,6 +12,7 @@ import argparse
 import logging
 import random
 import inspect
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -345,6 +346,139 @@ class SegmentationMetrics:
         return metrics
 
 
+class CrossEntropyWithPerClassFocal(nn.Module):
+    """Cross entropy combined with a per-class averaged focal component."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        ignore_index: Optional[int] = None,
+        focal_gamma: float = 2.0,
+        focal_weight: float = 0.5,
+    ) -> None:
+        super().__init__()
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        self.focal_gamma = focal_gamma
+        self.focal_weight = focal_weight
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = self.ce_loss(logits, targets)
+        if self.focal_weight == 0.0:
+            return ce
+
+        focal = self._per_class_focal_loss(logits, targets)
+        return ce + self.focal_weight * focal
+
+    def _per_class_focal_loss(
+        self, logits: torch.Tensor, targets: torch.Tensor
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            valid_mask = torch.ones_like(targets, dtype=torch.bool)
+            if self.ignore_index is not None:
+                valid_mask &= targets != self.ignore_index
+
+        if not valid_mask.any():
+            return torch.zeros((), device=logits.device, dtype=logits.dtype)
+
+        probs = torch.softmax(logits, dim=1)
+        probs = probs.permute(0, 2, 3, 1).reshape(-1, self.num_classes)
+        targets_flat = targets.view(-1)
+        valid_mask_flat = valid_mask.view(-1)
+
+        probs = probs[valid_mask_flat]
+        targets_flat = targets_flat[valid_mask_flat]
+        if probs.numel() == 0:
+            return torch.zeros((), device=logits.device, dtype=logits.dtype)
+
+        gathered = probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
+        gathered = torch.clamp(gathered, min=1e-6, max=1.0)
+        focal_terms = (-torch.log(gathered)) * (1.0 - gathered) ** self.focal_gamma
+
+        per_class_losses = []
+        for class_idx in range(self.num_classes):
+            class_mask = targets_flat == class_idx
+            if class_mask.any():
+                per_class_losses.append(focal_terms[class_mask].mean())
+
+        if not per_class_losses:
+            return torch.zeros((), device=logits.device, dtype=logits.dtype)
+
+        stacked = torch.stack(per_class_losses)
+        return stacked.mean()
+
+
+class GradientMonitor:
+    """Track gradient norms for selected parameter groups each training step."""
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        base_model = model.module if hasattr(model, "module") else model
+        param_dict = dict(base_model.named_parameters())
+
+        self.groups: Dict[str, list[torch.nn.Parameter]] = {}
+
+        mask_names = [
+            "sam_mask_decoder.mask_tokens.weight",
+            "sam_mask_decoder.iou_token.weight",
+        ]
+        if getattr(base_model.sam_mask_decoder, "pred_obj_scores", False):
+            mask_names.append("sam_mask_decoder.obj_score_token.weight")
+        mask_params = [param_dict[name] for name in mask_names if name in param_dict]
+        if mask_params:
+            self.groups["mask_tokens"] = mask_params
+
+        backbone_params = [
+            param
+            for name, param in param_dict.items()
+            if name.startswith("image_encoder.") and param.requires_grad
+        ]
+        if backbone_params:
+            self.groups["image_encoder"] = backbone_params
+
+        decoder_params = [
+            param
+            for name, param in param_dict.items()
+            if name.startswith("sam_mask_decoder.") and param.requires_grad
+        ]
+        if decoder_params:
+            self.groups.setdefault("sam_mask_decoder", decoder_params)
+
+        self._step_stats: Dict[str, list[tuple[float, float]]] = defaultdict(list)
+
+    def start_epoch(self) -> None:
+        self._step_stats = defaultdict(list)
+
+    def record_step(self) -> None:
+        if not self.groups:
+            return
+        for group_name, params in self.groups.items():
+            norms = [
+                param.grad.detach().norm()
+                for param in params
+                if param.grad is not None
+            ]
+            if not norms:
+                continue
+            stacked = torch.stack(norms)
+            mean_val = stacked.mean().item()
+            max_val = stacked.max().item()
+            self._step_stats[group_name].append((mean_val, max_val))
+
+    def end_epoch(self) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+        for group_name, stats in self._step_stats.items():
+            if not stats:
+                continue
+            stats_arr = np.array(stats, dtype=np.float64)
+            mean_series = stats_arr[:, 0]
+            max_series = stats_arr[:, 1]
+            metrics[f"grad_norm/{group_name}_mean"] = float(mean_series.mean())
+            metrics[f"grad_norm/{group_name}_max"] = float(max_series.max())
+            metrics[f"grad_norm/{group_name}_last"] = float(mean_series[-1])
+        self._step_stats = defaultdict(list)
+        return metrics
+
 def forward_semantic_logits(model: torch.nn.Module, images: torch.Tensor) -> torch.Tensor:
     """Run the Semantic SAM2 model and return per-class logits."""
     backbone_out = model.forward_image(images)
@@ -382,6 +516,7 @@ def train_one_epoch(
     grad_clip: float,
     num_classes: int,
     ignore_index: Optional[int],
+    grad_monitor: Optional[GradientMonitor] = None,
     progress_desc: str = "Train",
 ) -> Dict[str, float]:
     model.train()
@@ -389,6 +524,8 @@ def train_one_epoch(
     running_loss = 0.0
     num_samples = 0
     use_amp = scaler is not None and scaler.is_enabled()
+    if grad_monitor is not None:
+        grad_monitor.start_epoch()
 
     for batch in iter_with_progress(dataloader, progress_desc):
         images = batch["image"].to(device, non_blocking=True)
@@ -413,6 +550,9 @@ def train_one_epoch(
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
+        if grad_monitor is not None:
+            grad_monitor.record_step()
+
         batch_size = images.size(0)
         running_loss += loss.item() * batch_size
         num_samples += batch_size
@@ -423,6 +563,8 @@ def train_one_epoch(
     metrics["total_loss"] = float(running_loss)
     metrics["avg_loss"] = float(avg_loss)
     metrics["loss"] = float(avg_loss)
+    if grad_monitor is not None:
+        metrics.update(grad_monitor.end_epoch())
     return metrics
 
 
@@ -579,11 +721,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("semantic_sam2_runs"), help="Directory to store checkpoints.")
     parser.add_argument("--ignore-index", type=int, default=-1, help="Ignore index value used in the masks.")
     parser.add_argument("--augment", default=True, action="store_true", help="Enable simple flip augmentations.")
+    parser.add_argument("--focal-gamma", type=float, default=2.0, help="Gamma parameter for the focal loss component.")
+    parser.add_argument("--focal-weight", type=float, default=0.5, help="Weight applied to the focal component alongside cross-entropy.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--deterministic", action="store_true", help="Enable deterministic training (may reduce throughput).")
+    parser.add_argument("--deterministic", default=True, action="store_true", help="Enable deterministic training (may reduce throughput).")
     parser.add_argument("--wandb-project", type=str, default="sam2_NR206", help="Weights & Biases project name.")
     parser.add_argument("--wandb-run-name", type=str, default="local_test", help="Optional W&B run name override.")
-    parser.add_argument("--disable-wandb", default=True, action="store_true", help="Disable W&B logging.")
+    parser.add_argument("--disable-wandb", default=False, action="store_true", help="Disable W&B logging.")
     return parser.parse_args()
 
 
@@ -674,9 +818,16 @@ def main() -> None:
         drop_last=False,
     )
 
-    criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_index)
+    criterion = CrossEntropyWithPerClassFocal(
+        num_classes=args.num_classes,
+        ignore_index=args.ignore_index,
+        focal_gamma=args.focal_gamma,
+        focal_weight=args.focal_weight,
+    )
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+
+    grad_monitor = GradientMonitor(model)
 
     scheduler = None
     if args.lr_scheduler == "cosine":
@@ -730,6 +881,7 @@ def main() -> None:
                 grad_clip=args.grad_clip,
                 num_classes=args.num_classes,
                 ignore_index=args.ignore_index,
+                grad_monitor=grad_monitor,
                 progress_desc=f"Train {epoch}/{args.epochs}",
             )
             logging.info(
