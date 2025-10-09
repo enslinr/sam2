@@ -14,11 +14,12 @@ import random
 import inspect
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.cuda import amp
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -353,18 +354,33 @@ class CrossEntropyWithPerClassFocal(nn.Module):
         self,
         num_classes: int,
         ignore_index: Optional[int] = None,
-        focal_gamma: float = 2.0,
-        focal_weight: float = 0.5,
+        focal_gamma: float = 3.0,
+        focal_weight: float = 1.0,
+        class_weights: Optional[Sequence[float]] = None,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
         self.ignore_index = ignore_index
         self.focal_gamma = focal_gamma
         self.focal_weight = focal_weight
-        self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index)
+        if class_weights is not None:
+            weight_tensor = torch.tensor(class_weights, dtype=torch.float32)
+            if weight_tensor.numel() != self.num_classes:
+                raise ValueError(
+                    f"Class weights length ({weight_tensor.numel()}) must match num_classes ({self.num_classes})."
+                )
+            self.register_buffer("ce_weight", weight_tensor)
+        else:
+            self.register_buffer("ce_weight", torch.empty(0,device=logits.device, dtype=torch.float32))
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        ce = self.ce_loss(logits, targets)
+        ce_weight = self.ce_weight.to(logits.device) if self.ce_weight.numel() > 0 else None
+        ce = F.cross_entropy(
+            logits,
+            targets,
+            weight=ce_weight,
+            ignore_index=self.ignore_index,
+        )
         if self.focal_weight == 0.0:
             return ce
 
@@ -704,25 +720,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-images", type=Path, default=Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\val\img_stretched"), help="Directory with validation images.")
     parser.add_argument("--val-masks", type=Path, default=Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\val\mask_stretched"), help="Directory with validation masks.")
     parser.add_argument("--config-file", type=str, default="configs/sam2.1/sam2.1_hiera_b+.yaml", help="Hydra config name for the backbone (e.g. configs/sam2.1/sam2.1_hiera_b+.yaml).")
-    parser.add_argument("--checkpoint", type=str, default=root_dir/"checkpoints/sam2.1_hiera_base_plus.pt", help="Optional checkpoint path to initialize the model.")
-    # parser.add_argument("--checkpoint", type=str, default=root_dir/"semantic_sam2/training_checkpoints/FIE_best.pt", help="Optional checkpoint path to initialize the model.")
+    # parser.add_argument("--checkpoint", type=str, default=root_dir/"checkpoints/sam2.1_hiera_base_plus.pt", help="Optional checkpoint path to initialize the model.")
+    parser.add_argument("--checkpoint", type=str, default=root_dir/"semantic_sam2/training_checkpoints/FIE_best.pt", help="Optional checkpoint path to initialize the model.")
     parser.add_argument("--num-classes", type=int, default=9, help="Number of semantic classes (including background).")
     parser.add_argument("--use-safe-checkpoint", default=True, action="store_true", help="Use staged checkpoint loading to adapt mismatched decoders.")
     parser.add_argument("--device", type=str, default="cuda", help="Torch device to use (e.g. cuda, cuda:0, cpu).")
     parser.add_argument("--epochs", type=int, default=25, help="Number of training epochs.")
-    parser.add_argument("--batch-size", type=int, default=2, help="Batch size per step.")
-    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate.")
+    parser.add_argument("--batch-size", type=int, default=4, help="Batch size per step.")
+    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate for decoder and non-encoder parameters.")
+    parser.add_argument("--lr-image-encoder", type=float, default=5e-5, help="Learning rate for image encoder parameters (if trainable).")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="AdamW weight decay.")
     parser.add_argument("--num-workers", type=int, default=4, help="Data loader worker threads.")
     parser.add_argument("--amp", default=False, action="store_true", help="Enable mixed-precision training if CUDA is available.")
-    parser.add_argument("--freeze-image-encoder", default=True, action="store_true", help="Freeze all parameters in the image encoder during fine-tuning.")
+    parser.add_argument("--freeze-image-encoder", default=False, action="store_true", help="Freeze all parameters in the image encoder during fine-tuning.")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient norm clip value (0 disables clipping).")
-    parser.add_argument("--lr-scheduler", choices=["none", "cosine"], default="none", help="Learning rate schedule.")
+    parser.add_argument("--lr-scheduler", choices=["none", "cosine"], default="cosine", help="Learning rate schedule.")
     parser.add_argument("--output-dir", type=Path, default=Path("semantic_sam2_runs"), help="Directory to store checkpoints.")
     parser.add_argument("--ignore-index", type=int, default=-1, help="Ignore index value used in the masks.")
     parser.add_argument("--augment", default=True, action="store_true", help="Enable simple flip augmentations.")
-    parser.add_argument("--focal-gamma", type=float, default=2.0, help="Gamma parameter for the focal loss component.")
-    parser.add_argument("--focal-weight", type=float, default=0.5, help="Weight applied to the focal component alongside cross-entropy.")
+    parser.add_argument("--focal-gamma", type=float, default=3.0, help="Gamma parameter for the focal loss component.")
+    parser.add_argument("--focal-weight", type=float, default=1.0, help="Weight applied to the focal component alongside cross-entropy.")
+    parser.add_argument("--ce-class-weights", type=str, default="1,1,1,1.3,1,1,1,1.3,1" , help="Comma-separated list of class weights applied to the cross-entropy term.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--deterministic", default=True, action="store_true", help="Enable deterministic training (may reduce throughput).")
     parser.add_argument("--wandb-project", type=str, default="sam2_NR206", help="Weights & Biases project name.")
@@ -735,6 +753,17 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     set_seed(args.seed, deterministic=args.deterministic)
+
+    ce_class_weights: Optional[list[float]] = None
+    if args.ce_class_weights:
+        try:
+            ce_class_weights = [float(part) for part in args.ce_class_weights.split(",")]
+        except ValueError as exc:
+            raise SystemExit(f"Failed to parse --ce-class-weights '{args.ce_class_weights}': {exc}") from exc
+        if len(ce_class_weights) != args.num_classes:
+            raise SystemExit(
+                f"Expected {args.num_classes} weights in --ce-class-weights but received {len(ce_class_weights)}."
+            )
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -823,9 +852,40 @@ def main() -> None:
         ignore_index=args.ignore_index,
         focal_gamma=args.focal_gamma,
         focal_weight=args.focal_weight,
+        class_weights=ce_class_weights,
     )
-    params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    base_model = model.module if hasattr(model, "module") else model
+    encoder_params = []
+    non_encoder_params = []
+    for name, param in base_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith("image_encoder."):
+            encoder_params.append(param)
+        else:
+            non_encoder_params.append(param)
+
+    if not encoder_params and not non_encoder_params:
+        raise RuntimeError("No trainable parameters found for optimizer initialization.")
+
+    optimizer_param_groups = []
+    if non_encoder_params:
+        optimizer_param_groups.append({"params": non_encoder_params, "lr": args.lr})
+    if encoder_params:
+        optimizer_param_groups.append({"params": encoder_params, "lr": args.lr_image_encoder})
+
+    optimizer = torch.optim.AdamW(optimizer_param_groups, weight_decay=args.weight_decay)
+
+    def _count_params(param_list: list[torch.nn.Parameter]) -> int:
+        return sum(p.numel() for p in param_list)
+
+    logging.info(
+        "Optimizer groups: decoder/non-encoder=%d params @ lr=%.2e, encoder=%d params @ lr=%.2e",
+        _count_params(non_encoder_params),
+        args.lr,
+        _count_params(encoder_params),
+        args.lr_image_encoder if encoder_params else 0.0,
+    )
 
     grad_monitor = GradientMonitor(model)
 
@@ -845,6 +905,7 @@ def main() -> None:
             "checkpoint": args.checkpoint,
             "num_classes": args.num_classes,
             "lr": args.lr,
+            "lr_image_encoder": args.lr_image_encoder,
             "batch_size": args.batch_size,
             "epochs": args.epochs,
             "weight_decay": args.weight_decay,
@@ -854,6 +915,9 @@ def main() -> None:
             "train_masks": str(args.train_masks),
             "val_images": str(args.val_images),
             "val_masks": str(args.val_masks),
+            "focal_gamma": args.focal_gamma,
+            "focal_weight": args.focal_weight,
+            "ce_class_weights": args.ce_class_weights,
         }
         wandb_kwargs = {}
         if args.wandb_run_name:
