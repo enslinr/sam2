@@ -14,7 +14,7 @@ import random
 import inspect
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -32,6 +32,7 @@ import albumentations as A
 
 from setup_imports import root_dir
 from semantic_sam2.build_semantic_sam2 import build_semantic_sam2
+from semantic_sam2.training_utils import FocalLossCEAligned
 from semantic_sam2.wandb_wrapper import create_wandb_wrapper
 from semantic_sam2.visualization_utils import (
     create_training_visualizer,
@@ -144,6 +145,15 @@ class PairedImageMaskDataset(Dataset):
         self.ignore_index = ignore_index
         self.augment = augment
         self.augmentations = self._build_augmentations() if augment else None
+        self.use_cropping = False
+        self.crop_frequency = 0.0
+        self.crop_target_classes: list[int] = []
+        self.crop_background_class = 0
+        self.crop_min_margin = 123
+        self.crop_min_crop = 256
+        self.crop_extra_margin = 150
+        self.crop_extra_down = 50
+        self.crop_max_attempts = 50
         resampling = getattr(Image, 'Resampling', None)
         if resampling is not None:
             self._image_resample = resampling.BILINEAR
@@ -204,21 +214,65 @@ class PairedImageMaskDataset(Dataset):
             )
             return None
 
+    def configure_cropping(
+        self,
+        enabled: bool,
+        crop_frequency: float,
+        target_classes: Optional[Sequence[int]] = None,
+        background_class: int = 0,
+        min_margin: int = 123,
+        min_crop: int = 256,
+        extra_margin: int = 150,
+        extra_down: int = 50,
+        max_attempts: int = 50,
+    ) -> None:
+        self.use_cropping = enabled and crop_frequency > 0.0
+        self.crop_frequency = float(np.clip(crop_frequency, 0.0, 1.0))
+        self.crop_background_class = background_class
+        self.crop_min_margin = min_margin
+        self.crop_min_crop = min_crop
+        self.crop_extra_margin = extra_margin
+        self.crop_extra_down = extra_down
+        self.crop_max_attempts = max(1, max_attempts)
+        if target_classes:
+            self.crop_target_classes = [
+                int(cls) for cls in target_classes if int(cls) != background_class
+            ]
+        elif self.num_classes is not None and self.num_classes > 2:
+            middle_class = self.num_classes // 2
+            if middle_class == background_class and middle_class + 1 < self.num_classes:
+                middle_class += 1
+            self.crop_target_classes = [middle_class]
+        else:
+            self.crop_target_classes = []
+        if self.use_cropping and not self.crop_target_classes:
+            logging.warning(
+                "Cropping enabled but no valid target classes found; disabling cropping."
+            )
+            self.use_cropping = False
+
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         image_path, mask_path = self.pairs[index]
         image = Image.open(image_path).convert("RGB")
         mask = Image.open(mask_path)
 
+        image_np = np.array(image)
+        mask_np = np.array(mask, dtype=np.uint8)
+
         if self.augmentations is not None:
-            image_np = np.array(image)
-            mask_np = np.array(mask, dtype=np.uint8)
             augmented = self.augmentations(image=image_np, mask=mask_np)
-            image_aug = augmented["image"]
-            mask_aug = augmented["mask"]
-            if mask_aug.dtype != np.uint8:
-                mask_aug = mask_aug.astype(np.uint8)
-            image = Image.fromarray(image_aug)
-            mask = Image.fromarray(mask_aug)
+            image_np = augmented["image"]
+            mask_np = augmented["mask"]
+            if mask_np.dtype != np.uint8:
+                mask_np = mask_np.astype(np.uint8, copy=False)
+
+        if self.use_cropping and random.random() < self.crop_frequency:
+            cropped = self._maybe_apply_crop(image_np, mask_np)
+            if cropped is not None:
+                image_np, mask_np = cropped
+
+        image = Image.fromarray(image_np)
+        mask = Image.fromarray(mask_np)
 
         mask = mask.resize((self.image_size, self.image_size), resample=self._mask_resample)
         mask_array = np.array(mask, dtype=np.int64)
@@ -248,6 +302,102 @@ class PairedImageMaskDataset(Dataset):
             "image_path": str(image_path),
             "mask_path": str(mask_path),
         }
+
+    def _maybe_apply_crop(
+        self, image_np: np.ndarray, mask_np: np.ndarray
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        if not self.crop_target_classes:
+            return None
+
+        candidate_classes = self.crop_target_classes.copy()
+        random.shuffle(candidate_classes)
+        for target_class in candidate_classes:
+            try:
+                bounds = self._sample_padded_crop(mask_np, target_class)
+            except (RuntimeError, ValueError):
+                continue
+            if bounds is None:
+                continue
+            top, bottom, left, right = bounds
+            cropped_img = image_np[top:bottom, left:right]
+            cropped_mask = mask_np[top:bottom, left:right]
+            if cropped_img.size == 0 or cropped_mask.size == 0:
+                continue
+            return cropped_img, cropped_mask
+        return None
+
+    def _sample_padded_crop(
+        self, mask: np.ndarray, target_class: int
+    ) -> Optional[Tuple[int, int, int, int]]:
+        h, w = mask.shape[:2]
+        coords = np.argwhere(mask == target_class)
+        if coords.size == 0:
+            raise ValueError(f"No pixels found for target class {target_class}.")
+
+        min_margin = self.crop_min_margin
+        valid = [
+            (y, x)
+            for y, x in coords
+            if (min_margin <= y < h - min_margin) and (min_margin <= x < w - min_margin)
+        ]
+        if not valid:
+            raise ValueError(
+                f"No candidate pixels satisfy the margin constraint for class {target_class}."
+            )
+
+        background_class = self.crop_background_class
+        for _ in range(self.crop_max_attempts):
+            center_y, center_x = random.choice(valid)
+
+            up = center_y
+            while up >= 0 and mask[up, center_x] != background_class:
+                up -= 1
+
+            down = center_y
+            while down < h and mask[down, center_x] != background_class:
+                down += 1
+
+            if up < 0 or down >= h:
+                continue
+
+            band_height = down - up - 1
+            crop_size = max(band_height + self.crop_extra_margin + self.crop_extra_down, self.crop_min_crop)
+            crop_size = min(crop_size, min(h, w))
+            if crop_size < self.crop_min_crop:
+                continue
+
+            band_top = up + 1
+            band_bottom = down - 1
+            top_low = max(band_bottom + 1 - crop_size, 0)
+            top_high = min(band_top, h - crop_size)
+            if top_low > top_high:
+                continue
+
+            top = int(np.clip(center_y - crop_size // 2 + self.crop_extra_down, top_low, top_high))
+            bottom = top + crop_size
+            if bottom > h:
+                shift = bottom - h
+                top -= shift
+                bottom -= shift
+            top = max(top, 0)
+            bottom = min(bottom, h)
+
+            horizontal_size = crop_size
+            left = int(np.clip(center_x - horizontal_size // 2, 0, w - horizontal_size))
+            right = left + horizontal_size
+            if right > w:
+                shift = right - w
+                left -= shift
+                right -= shift
+            left = max(left, 0)
+            right = min(right, w)
+
+            if bottom - top <= 0 or right - left <= 0:
+                continue
+
+            return top, bottom, left, right
+
+        raise RuntimeError("Failed to sample a valid crop after multiple attempts.")
 
 
 class SegmentationMetrics:
@@ -347,82 +497,10 @@ class SegmentationMetrics:
         return metrics
 
 
-class CrossEntropyWithPerClassFocal(nn.Module):
-    """Cross entropy combined with a per-class averaged focal component."""
 
-    def __init__(
-        self,
-        num_classes: int,
-        ignore_index: Optional[int] = None,
-        focal_gamma: float = 3.0,
-        focal_weight: float = 1.0,
-        class_weights: Optional[Sequence[float]] = None,
-    ) -> None:
-        super().__init__()
-        self.num_classes = num_classes
-        self.ignore_index = ignore_index
-        self.focal_gamma = focal_gamma
-        self.focal_weight = focal_weight
-        if class_weights is not None:
-            weight_tensor = torch.tensor(class_weights, dtype=torch.float32)
-            if weight_tensor.numel() != self.num_classes:
-                raise ValueError(
-                    f"Class weights length ({weight_tensor.numel()}) must match num_classes ({self.num_classes})."
-                )
-            self.register_buffer("ce_weight", weight_tensor)
-        else:
-            self.register_buffer("ce_weight", torch.empty(0,device=logits.device, dtype=torch.float32))
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        ce_weight = self.ce_weight.to(logits.device) if self.ce_weight.numel() > 0 else None
-        ce = F.cross_entropy(
-            logits,
-            targets,
-            weight=ce_weight,
-            ignore_index=self.ignore_index,
-        )
-        if self.focal_weight == 0.0:
-            return ce
 
-        focal = self._per_class_focal_loss(logits, targets)
-        return ce + self.focal_weight * focal
 
-    def _per_class_focal_loss(
-        self, logits: torch.Tensor, targets: torch.Tensor
-    ) -> torch.Tensor:
-        with torch.no_grad():
-            valid_mask = torch.ones_like(targets, dtype=torch.bool)
-            if self.ignore_index is not None:
-                valid_mask &= targets != self.ignore_index
-
-        if not valid_mask.any():
-            return torch.zeros((), device=logits.device, dtype=logits.dtype)
-
-        probs = torch.softmax(logits, dim=1)
-        probs = probs.permute(0, 2, 3, 1).reshape(-1, self.num_classes)
-        targets_flat = targets.view(-1)
-        valid_mask_flat = valid_mask.view(-1)
-
-        probs = probs[valid_mask_flat]
-        targets_flat = targets_flat[valid_mask_flat]
-        if probs.numel() == 0:
-            return torch.zeros((), device=logits.device, dtype=logits.dtype)
-
-        gathered = probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
-        gathered = torch.clamp(gathered, min=1e-6, max=1.0)
-        focal_terms = (-torch.log(gathered)) * (1.0 - gathered) ** self.focal_gamma
-
-        per_class_losses = []
-        for class_idx in range(self.num_classes):
-            class_mask = targets_flat == class_idx
-            if class_mask.any():
-                per_class_losses.append(focal_terms[class_mask].mean())
-
-        if not per_class_losses:
-            return torch.zeros((), device=logits.device, dtype=logits.dtype)
-
-        stacked = torch.stack(per_class_losses)
-        return stacked.mean()
 
 
 class GradientMonitor:
@@ -732,7 +810,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.01, help="AdamW weight decay.")
     parser.add_argument("--num-workers", type=int, default=4, help="Data loader worker threads.")
     parser.add_argument("--amp", default=False, action="store_true", help="Enable mixed-precision training if CUDA is available.")
-    parser.add_argument("--freeze-image-encoder", default=False, action="store_true", help="Freeze all parameters in the image encoder during fine-tuning.")
+    parser.add_argument("--freeze-image-encoder", default=True, action="store_true", help="Freeze all parameters in the image encoder during fine-tuning.")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient norm clip value (0 disables clipping).")
     parser.add_argument("--lr-scheduler", choices=["none", "cosine"], default="cosine", help="Learning rate schedule.")
     parser.add_argument("--output-dir", type=Path, default=Path("semantic_sam2_runs"), help="Directory to store checkpoints.")
@@ -740,12 +818,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--augment", default=True, action="store_true", help="Enable simple flip augmentations.")
     parser.add_argument("--focal-gamma", type=float, default=3.0, help="Gamma parameter for the focal loss component.")
     parser.add_argument("--focal-weight", type=float, default=1.0, help="Weight applied to the focal component alongside cross-entropy.")
-    parser.add_argument("--ce-class-weights", type=str, default="1,1,1,1.3,1,1,1,1.3,1" , help="Comma-separated list of class weights applied to the cross-entropy term.")
+    parser.add_argument("--ce-class-weights", type=str, default="1,1,1,1.3,1,1,1,1.3,1", help="Comma-separated list of class weights applied to the cross-entropy term.")
+    parser.add_argument("--enable-cropping", default=True, action="store_true", help="Enable class-focused cropping augmentation.")
+    parser.add_argument("--crop-frequency", type=float, default=0.5, help="Probability of applying a focused crop to a sample when cropping is enabled.")
+    parser.add_argument("--crop-target-classes", type=str, default=None, help="Comma-separated list of target classes to bias cropping towards (defaults to middle class).")
+    parser.add_argument("--crop-min-margin", type=int, default=123, help="Minimum distance from image border for crop seed points.")
+    parser.add_argument("--crop-min-size", type=int, default=256, help="Minimum crop edge length before resizing to the model input size.")
+    parser.add_argument("--crop-extra-margin", type=int, default=150, help="Additional padding added to the class band when computing crop size.")
+    parser.add_argument("--crop-extra-down", type=int, default=50, help="Extra downward padding to include below the sampled center point.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--deterministic", default=True, action="store_true", help="Enable deterministic training (may reduce throughput).")
     parser.add_argument("--wandb-project", type=str, default="sam2_NR206", help="Weights & Biases project name.")
     parser.add_argument("--wandb-run-name", type=str, default="local_test", help="Optional W&B run name override.")
-    parser.add_argument("--disable-wandb", default=False, action="store_true", help="Disable W&B logging.")
+    parser.add_argument("--disable-wandb", default=True, action="store_true", help="Disable W&B logging.")
     return parser.parse_args()
 
 
@@ -754,15 +839,33 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     set_seed(args.seed, deterministic=args.deterministic)
 
-    ce_class_weights: Optional[list[float]] = None
+    ce_class_weights: Optional[torch.Tensor] = None
     if args.ce_class_weights:
         try:
-            ce_class_weights = [float(part) for part in args.ce_class_weights.split(",")]
+            weights = [float(part) for part in args.ce_class_weights.split(",")]
         except ValueError as exc:
             raise SystemExit(f"Failed to parse --ce-class-weights '{args.ce_class_weights}': {exc}") from exc
-        if len(ce_class_weights) != args.num_classes:
+        if len(weights) != args.num_classes:
             raise SystemExit(
-                f"Expected {args.num_classes} weights in --ce-class-weights but received {len(ce_class_weights)}."
+                f"Expected {args.num_classes} weights in --ce-class-weights but received {len(weights)}."
+            )
+        ce_class_weights = torch.tensor(weights, dtype=torch.float32)
+
+
+    crop_target_classes: Optional[list[int]] = None
+    if args.crop_target_classes:
+        try:
+            crop_target_classes = [int(part) for part in args.crop_target_classes.split(",")]
+        except ValueError as exc:
+            raise SystemExit(
+                f"Failed to parse --crop-target-classes '{args.crop_target_classes}': {exc}"
+            ) from exc
+        invalid_classes = [
+            cls for cls in crop_target_classes if cls < 0 or cls >= args.num_classes
+        ]
+        if invalid_classes:
+            raise SystemExit(
+                f"Crop target classes {invalid_classes} fall outside the valid range [0, {args.num_classes - 1}]."
             )
 
     if args.device == "auto":
@@ -820,6 +923,16 @@ def main() -> None:
         ignore_index=args.ignore_index,
         augment=args.augment,
     )
+    train_dataset.configure_cropping(
+        enabled=args.enable_cropping,
+        crop_frequency=args.crop_frequency,
+        target_classes=crop_target_classes,
+        background_class=0,
+        min_margin=args.crop_min_margin,
+        min_crop=args.crop_min_size,
+        extra_margin=args.crop_extra_margin,
+        extra_down=args.crop_extra_down,
+    )
     val_dataset = PairedImageMaskDataset(
         image_dir=args.val_images,
         mask_dir=args.val_masks,
@@ -827,6 +940,10 @@ def main() -> None:
         num_classes=args.num_classes,
         ignore_index=args.ignore_index,
         augment=False,
+    )
+    val_dataset.configure_cropping(
+        enabled=False,
+        crop_frequency=0.0,
     )
 
     pin_memory = device.type == "cuda"
@@ -847,12 +964,11 @@ def main() -> None:
         drop_last=False,
     )
 
-    criterion = CrossEntropyWithPerClassFocal(
-        num_classes=args.num_classes,
+    criterion = FocalLossCEAligned(
+        gamma=args.focal_gamma,
+        weight=ce_class_weights,
         ignore_index=args.ignore_index,
-        focal_gamma=args.focal_gamma,
-        focal_weight=args.focal_weight,
-        class_weights=ce_class_weights,
+        reduction='mean'
     )
     base_model = model.module if hasattr(model, "module") else model
     encoder_params = []
@@ -918,6 +1034,13 @@ def main() -> None:
             "focal_gamma": args.focal_gamma,
             "focal_weight": args.focal_weight,
             "ce_class_weights": args.ce_class_weights,
+            "enable_cropping": args.enable_cropping,
+            "crop_frequency": args.crop_frequency,
+            "crop_target_classes": args.crop_target_classes,
+            "crop_min_margin": args.crop_min_margin,
+            "crop_min_size": args.crop_min_size,
+            "crop_extra_margin": args.crop_extra_margin,
+            "crop_extra_down": args.crop_extra_down,
         }
         wandb_kwargs = {}
         if args.wandb_run_name:
