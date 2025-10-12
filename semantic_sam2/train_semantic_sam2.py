@@ -49,6 +49,9 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
+HEALTHY_MEAN = (0.238, 0.238, 0.238)
+HEALTHY_STD = (0.168, 0.168, 0.168)
+
 
 def freeze_image_encoder_parameters(model):
     base_model = model.module if hasattr(model, 'module') else model
@@ -92,6 +95,12 @@ class PairedImageMaskDataset(Dataset):
         num_classes: Optional[int] = None,
         ignore_index: Optional[int] = None,
         augment: bool = False,
+        pad_only: bool = False,
+        pad_center: bool = False,
+        norm_mean: Tuple = IMAGENET_MEAN,
+        norm_std: Tuple = IMAGENET_STD,
+        apply_norm: Tuple = True,
+        rotate_angle: int = 5,
     ) -> None:
         self.image_dir = Path(image_dir)
         self.mask_dir = Path(mask_dir)
@@ -140,10 +149,20 @@ class PairedImageMaskDataset(Dataset):
                 "No image/mask pairs found. Ensure filenames match between directories."
             )
 
+        self.norm_mean = norm_mean
+        self.norm_std = norm_std
+        self.apply_norm = apply_norm
         self.image_size = image_size
         self.num_classes = num_classes
         self.ignore_index = ignore_index
         self.augment = augment
+        self.rotate_angle = rotate_angle
+        self.pad_only = pad_only
+        if self.pad_only and self.ignore_index is None:
+            raise ValueError("pad_only=True requires a valid ignore_index to mask padded pixels.")
+        self.pad_center = pad_center
+        if self.pad_center and not self.pad_only:
+            raise ValueError("pad_center=True requires pad_only=True.")
         self.augmentations = self._build_augmentations() if augment else None
         self.use_cropping = False
         self.crop_frequency = 0.0
@@ -166,21 +185,21 @@ class PairedImageMaskDataset(Dataset):
         return len(self.pairs)
 
     def _build_augmentations(self):
-        rotate_kwargs = {
-            "limit": (-5, 5),
-            "interpolation": cv2.INTER_LINEAR,
-            "border_mode": cv2.BORDER_CONSTANT,
-            "crop_border": False,
-            "mask_interpolation": cv2.INTER_NEAREST,
-            "fill": 0,
-            "fill_mask": 0,
-            "p": 0.8,
-        }
-        if "rotate_method" in inspect.signature(A.Rotate.__init__).parameters:
-            rotate_kwargs["rotate_method"] = "ellipse"
+        transforms = [A.HorizontalFlip(p=0.8)]
 
-        transforms = [A.HorizontalFlip(p=0.8), A.Rotate(**rotate_kwargs)]
-
+        transforms.append(
+            A.Rotate(
+                limit=[-self.rotate_angle, self.rotate_angle],
+                interpolation=cv2.INTER_LINEAR,
+                border_mode=cv2.BORDER_CONSTANT,
+                rotate_method="ellipse",
+                crop_border=False,
+                mask_interpolation=cv2.INTER_NEAREST,
+                fill=0,
+                fill_mask=0,
+                p=0.8
+            )
+        )
 
         transforms.append(
             A.AdvancedBlur(
@@ -193,8 +212,6 @@ class PairedImageMaskDataset(Dataset):
                 p=0.8,
             )
         )
-
-
         transforms.append(
             A.ColorJitter(
                 brightness=[0.8, 1.2],
@@ -271,13 +288,19 @@ class PairedImageMaskDataset(Dataset):
             if cropped is not None:
                 image_np, mask_np = cropped
 
-        image = Image.fromarray(image_np)
-        mask = Image.fromarray(mask_np)
+        if self.pad_only:
+            padded_image_np, mask_array = self._pad_sample_numpy(image_np, mask_np)
+            image = Image.fromarray(padded_image_np)
+        else:
+            image = Image.fromarray(image_np)
+            mask = Image.fromarray(mask_np)
 
-        mask = mask.resize((self.image_size, self.image_size), resample=self._mask_resample)
-        mask_array = np.array(mask, dtype=np.int64)
-        if mask_array.ndim == 3:
-            mask_array = mask_array[..., 0]
+            mask = mask.resize((self.image_size, self.image_size), resample=self._mask_resample)
+            mask_array = np.array(mask, dtype=np.int64)
+            if mask_array.ndim == 3:
+                mask_array = mask_array[..., 0]
+
+            image = image.resize((self.image_size, self.image_size), resample=self._image_resample)
 
         mask_tensor = torch.tensor(mask_array, dtype=torch.long)
         if self.num_classes is not None:
@@ -292,16 +315,53 @@ class PairedImageMaskDataset(Dataset):
             if negative.any():
                 mask_tensor[negative] = self.ignore_index
 
-        image = image.resize((self.image_size, self.image_size), resample=self._image_resample)
-        image_tensor = TF.to_tensor(image)
-        image_tensor = TF.normalize(image_tensor, IMAGENET_MEAN, IMAGENET_STD)
+        image_tensor_unNorm = TF.to_tensor(image)
+        if self.apply_norm:
+            image_tensor = TF.normalize(image_tensor_unNorm, self.norm_mean, self.norm_std)
+        else:
+            image_tensor = image_tensor_unNorm
 
         return {
             "image": image_tensor,
             "mask": mask_tensor,
             "image_path": str(image_path),
             "mask_path": str(mask_path),
+            "unNorm_image": image_tensor_unNorm
         }
+
+    def _pad_sample_numpy(
+        self,
+        image_np: np.ndarray,
+        mask_np: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Zero-pad image and mask to the configured image_size."""
+        h, w = image_np.shape[:2]
+        target = self.image_size
+        if h > target or w > target:
+            raise ValueError(
+                f"Pad-only mode requires image dimensions <= image_size ({target}); "
+                f"received image size ({h}, {w})."
+            )
+
+        pad_top = (target - h) // 2 if self.pad_center else 0
+        pad_left = (target - w) // 2 if self.pad_center else 0
+        pad_bottom = pad_top + h
+        pad_right = pad_left + w
+        padded_image = np.zeros((target, target, image_np.shape[2]), dtype=image_np.dtype)
+        padded_image[pad_top:pad_bottom, pad_left:pad_right] = image_np
+
+        if mask_np.ndim == 3:
+            mask_np = mask_np[..., 0]
+        mask_np = mask_np.astype(np.int64, copy=False)
+        pad_fill = self.ignore_index if self.ignore_index is not None else 0
+        padded_mask = np.full((target, target), pad_fill, dtype=np.int64)
+        mask_h, mask_w = mask_np.shape
+        mask_top = (target - mask_h) // 2 if self.pad_center else 0
+        mask_left = (target - mask_w) // 2 if self.pad_center else 0
+        mask_bottom = mask_top + mask_h
+        mask_right = mask_left + mask_w
+        padded_mask[mask_top:mask_bottom, mask_left:mask_right] = mask_np
+        return padded_image, padded_mask
 
     def _maybe_apply_crop(
         self, image_np: np.ndarray, mask_np: np.ndarray
@@ -816,6 +876,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("semantic_sam2_runs"), help="Directory to store checkpoints.")
     parser.add_argument("--ignore-index", type=int, default=-1, help="Ignore index value used in the masks.")
     parser.add_argument("--augment", default=True, action="store_true", help="Enable simple flip augmentations.")
+    parser.add_argument("--pad-only", default=False, action="store_true", help="Zero-pad inputs to image_size instead of resizing.")
+    parser.add_argument("--center-pad", default=False, action="store_true", help="Center content when using pad-only mode.")
     parser.add_argument("--focal-gamma", type=float, default=3.0, help="Gamma parameter for the focal loss component.")
     parser.add_argument("--focal-weight", type=float, default=1.0, help="Weight applied to the focal component alongside cross-entropy.")
     parser.add_argument("--ce-class-weights", type=str, default="1,1,1,1.3,1,1,1,1.3,1", help="Comma-separated list of class weights applied to the cross-entropy term.")
@@ -838,6 +900,8 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     set_seed(args.seed, deterministic=args.deterministic)
+    if args.center_pad and not args.pad_only:
+        raise SystemExit("--center-pad requires --pad-only to be set.")
 
     ce_class_weights: Optional[torch.Tensor] = None
     if args.ce_class_weights:
@@ -922,6 +986,8 @@ def main() -> None:
         num_classes=args.num_classes,
         ignore_index=args.ignore_index,
         augment=args.augment,
+        pad_only=args.pad_only,
+        pad_center=args.center_pad,
     )
     train_dataset.configure_cropping(
         enabled=args.enable_cropping,
@@ -940,6 +1006,8 @@ def main() -> None:
         num_classes=args.num_classes,
         ignore_index=args.ignore_index,
         augment=False,
+        pad_only=args.pad_only,
+        pad_center=args.center_pad,
     )
     val_dataset.configure_cropping(
         enabled=False,
@@ -1026,6 +1094,8 @@ def main() -> None:
             "epochs": args.epochs,
             "weight_decay": args.weight_decay,
             "augment": args.augment,
+            "pad_only": args.pad_only,
+            "center_pad": args.center_pad,
             "freeze_image_encoder": args.freeze_image_encoder,
             "train_images": str(args.train_images),
             "train_masks": str(args.train_masks),
