@@ -15,3 +15,4 @@ demo/backend/checkpoints/*.pt
 *.log
 wandb/*
 semantic_sam2_runs/*
+semantic_sam2/pred_cache/
