@@ -1,0 +1,44 @@
+program: SAM2/semantic_sam2/sweep/train_semantic_sam2_sweep.py
+
+method: bayes
+
+project: sam2_NR206_sweep
+entity: 2630054-university-of-witwatersrand
+
+metric: {name: val/mean_iou, goal: maximize}
+parameters:
+  lr: {distribution: log_uniform_values, min: 1.0e-6, max: 1.0e-1}
+  lr_image_encoder: {distribution: log_uniform_values, min: 1.0e-10, max: 1.0e-2}
+  weight_decay: {values: [0.0, 0.01, 0.05]}
+  batch_size: {values: [1,2,4]}
+  grad_clip: {values: [0.0, 0.5, 1.0, 2.0]}
+  focal_gamma: {values: [0.0,1.0,2.0,3.0,4.0,10.0]}
+  ce_class_weights:
+    values:
+      - "1,1,1,1.3,1,1,1,1.3,1"
+      - "0.01,1,1,1,1,1,1,1,1"
+      - "1,1,1,1,1,1,1,1,1"
+  lr_scheduler: {values: ["none","cosine"]}
+  seed: {values: [17,42,123]}
+  aug_rot_angle:
+    values: [0, 5, 15, 30, 45, 60, 90]
+  img_normalization:
+    values:
+      - null
+      - imagenet
+      - healthy
+  pad_only:
+    values: [false, true]
+  bc_strength: {distribution: uniform, min: 0.05, max: 0.30}
+  noise_std: {distribution: uniform, min: 0.0, max: 0.03}
+  blur_p: {distribution: uniform, min: 0.0, max: 0.5}
+  blur_k:
+    values: [3, 5, 7]
+  elastic_p: {distribution: uniform, min: 0.0, max: 0.4}
+  grid_p: {distribution: uniform, min: 0.0, max: 0.3}
+  gamma_min:
+    values: [0.9, 0.95]
+  gamma_max:
+    values: [1.05, 1.1]
+  use_clahe:
+    values: [0, 1]
