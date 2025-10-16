@@ -24,7 +24,7 @@ from semantic_sam2.build_semantic_sam2 import build_semantic_sam2
 from semantic_sam2.train_semantic_sam2 import (
     set_seed,
     PairedImageMaskDataset,
-    CrossEntropyWithPerClassFocal,
+    FocalLossCEAligned,
     freeze_image_encoder_parameters,
     GradientMonitor,
     train_one_epoch,
@@ -32,69 +32,105 @@ from semantic_sam2.train_semantic_sam2 import (
     flatten_metrics,
     visualize_predictions,
     save_checkpoint,
+    resolve_normalization,
 )
 from semantic_sam2.visualization_utils import create_training_visualizer
 
-RUN_ON_CLUSTER = True
+RUN_ON_CLUSTER = False
 
 
 # --- Default configuration used when starting runs (sweeps will override)
 if RUN_ON_CLUSTER:
-    DEFAULTS = dict(
-        # Data
-        train_images=str(Path("/home-mscluster/wroux/processed_data/Healthy/train/img_stretched")),
-        train_masks=str(Path("/home-mscluster/wroux/processed_data/Healthy/train/mask_stretched")),
-        val_images=str(Path("/home-mscluster/wroux/processed_data/Healthy/val/img_stretched")),
-        val_masks=str(Path("/home-mscluster/wroux/processed_data/Healthy/val/mask_stretched")),
-
-        # Model/backbone
-        config_file="configs/sam2.1/sam2.1_hiera_b+.yaml",
-        checkpoint=str(root_dir / "checkpoints/sam2.1_hiera_base_plus.pt"),
-        use_safe_checkpoint=True,
-        num_classes=9,
-
-        # Train loop
-        device="cuda",
-        epochs=200,
-        # epochs=10,
-        batch_size=4,
-        num_workers=4,
-        lr=2e-4,
-        lr_image_encoder=5e-5,
-        weight_decay=0.01,
-        amp=True,
-        grad_clip=1.0,
-        lr_scheduler="cosine",
-        freeze_image_encoder=False,
-
-        # Loss
-        focal_gamma=3.0,
-        focal_weight=1.0,
-        ce_class_weights="1,1,1,1.3,1,1,1,1.3,1",  # parsed to list later
-        ignore_index=-1,
-
-        # Augment & cropping
-        augment=True,
-        enable_cropping=False,
-    
-        # Repro
-        seed=42,
-        deterministic=True,
-
-        # Logging/output
-        wandb_project="sam2_NR206_sweep",
-        wandb_run_name=None,
-        output_dir="semantic_sam2_runs/run_training_sweep",
-    )
+    # Data
+    train_images=str(Path("/home-mscluster/wroux/processed_data/Healthy/train/img_stretched"))
+    train_masks=str(Path("/home-mscluster/wroux/processed_data/Healthy/train/mask_stretched"))
+    val_images=str(Path("/home-mscluster/wroux/processed_data/Healthy/val/img_stretched"))
+    val_masks=str(Path("/home-mscluster/wroux/processed_data/Healthy/val/mask_stretched"))
+    freeze_image_encoder=False
+else:
+    # Data
+    train_images=str(Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\train\img_unchanged"))
+    train_masks=str(Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\train\mask_unchanged"))
+    val_images=str(Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\val\img_unchanged"))
+    val_masks=str(Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\val\mask_unchanged"))
+    freeze_image_encoder=True
 
 
-def parse_ce_weights(s: Optional[str], num_classes: int) -> Optional[list[float]]:
+
+
+DEFAULTS = dict(
+    # Data
+    train_images=train_images,
+    train_masks=train_masks,
+    val_images=val_images,
+    val_masks=val_masks,
+
+    # Model/backbone
+    config_file="configs/sam2.1/sam2.1_hiera_b+.yaml",
+    checkpoint=str(root_dir / "checkpoints/sam2.1_hiera_base_plus.pt"),
+    use_safe_checkpoint=True,
+    num_classes=9,
+
+    # Train loop
+    device="cuda",
+    epochs=200,
+    # epochs=10,
+    batch_size=2,
+    num_workers=2,
+    lr=2e-4,
+    lr_image_encoder=5e-5,
+    weight_decay=0.01,
+    amp=True,
+    grad_clip=1.0,
+    lr_scheduler="cosine",
+    freeze_image_encoder=freeze_image_encoder,
+
+    # Loss
+    focal_gamma=3.0,
+    focal_weight=1.0,
+    ce_class_weights="1,1,1,1.3,1,1,1,1.3,1",  # parsed to list later
+    ignore_index=-1,
+
+    # Augment & cropping
+    augment=True,
+    aug_rot_angle=5,
+    img_normalization="imagenet",
+    pad_only=True,
+    bc_strength=0.2,
+    noise_std=0.0,
+    blur_p=0.0,
+    blur_k=3,
+    elastic_p=0.0,
+    grid_p=0.0,
+    gamma_min=0.9,
+    gamma_max=1.1,
+    use_clahe=0,
+    enable_cropping=False,
+
+    # Repro
+    seed=42,
+    deterministic=True,
+
+    # Logging/output
+    wandb_project="sam2_NR206_sweep",
+    wandb_run_name=None,
+    output_dir="semantic_sam2_runs/run_training_sweep",
+)
+
+
+def parse_ce_weights(s: Optional[str], num_classes: int) -> Optional[torch.Tensor]:
     if not s:
         return None
-    parts = [float(x) for x in s.split(",")]
-    if len(parts) != num_classes:
-        raise ValueError(f"ce_class_weights expects {num_classes} values, got {len(parts)}")
-    return parts
+    try:
+        weights = [float(part) for part in s.split(",")]
+    except ValueError as exc:
+        raise SystemExit(f"Failed to parse --ce-class-weights '{s}': {exc}") from exc
+    if len(weights) != num_classes:
+        raise SystemExit(
+            f"Expected {num_classes} weights in --ce-class-weights but received {len(weights)}."
+        )
+    ce_class_weights = torch.tensor(weights, dtype=torch.float32)
+    return ce_class_weights
 
 
 def parse_crop_targets(s: Optional[str], num_classes: int) -> Optional[list[int]]:
@@ -155,6 +191,32 @@ def train():
     K = int(cfg["num_classes"])
     ce_weights = parse_ce_weights(cfg["ce_class_weights"], K) if cfg.get("ce_class_weights") else None
     crop_targets = parse_crop_targets(cfg["crop_target_classes"], K) if cfg.get("crop_target_classes") else None
+    try:
+        apply_norm, norm_mean, norm_std = resolve_normalization(cfg.get("img_normalization"))
+    except ValueError as exc:
+        raise ValueError(f"Invalid img_normalization preset: {cfg.get('img_normalization')}") from exc
+    rot_angle = int(cfg["aug_rot_angle"])
+    pad_only = bool(cfg.get("pad_only", False))
+    bc_strength = float(cfg.get("bc_strength", 0.2))
+    noise_std = float(cfg.get("noise_std", 0.0))
+    blur_p = float(cfg.get("blur_p", 0.0))
+    blur_k = int(cfg.get("blur_k", 3))
+    elastic_p = float(cfg.get("elastic_p", 0.0))
+    grid_p = float(cfg.get("grid_p", 0.0))
+    gamma_min = float(cfg.get("gamma_min", 0.9))
+    gamma_max = float(cfg.get("gamma_max", 1.1))
+    if gamma_min <= 0 or gamma_max <= 0:
+        raise ValueError("gamma_min and gamma_max must be positive.")
+    if gamma_min > gamma_max:
+        raise ValueError("gamma_min must be <= gamma_max.")
+    use_clahe_cfg = cfg.get("use_clahe", 0)
+    if isinstance(use_clahe_cfg, str):
+        use_clahe = use_clahe_cfg.strip().lower() in ("1", "true", "yes")
+    else:
+        use_clahe = bool(use_clahe_cfg)
+
+
+        
 
     train_dataset = PairedImageMaskDataset(
         image_dir=Path(cfg["train_images"]),
@@ -163,6 +225,20 @@ def train():
         num_classes=K,
         ignore_index=int(cfg["ignore_index"]),
         augment=bool(cfg["augment"]),
+        norm_mean=norm_mean,
+        norm_std=norm_std,
+        apply_norm=apply_norm,
+        rotate_angle=rot_angle,
+        pad_only=pad_only,
+        bc_strength=bc_strength,
+        noise_std=noise_std,
+        blur_p=blur_p,
+        blur_k=blur_k,
+        elastic_p=elastic_p,
+        grid_p=grid_p,
+        gamma_min=gamma_min,
+        gamma_max=gamma_max,
+        use_clahe=use_clahe,
     )
     train_dataset.configure_cropping(enabled=False, crop_frequency=0.0)
 
@@ -173,6 +249,20 @@ def train():
         num_classes=K,
         ignore_index=int(cfg["ignore_index"]),
         augment=False,
+        norm_mean=norm_mean,
+        norm_std=norm_std,
+        apply_norm=apply_norm,
+        rotate_angle=rot_angle,
+        pad_only=pad_only,
+        bc_strength=bc_strength,
+        noise_std=noise_std,
+        blur_p=blur_p,
+        blur_k=blur_k,
+        elastic_p=elastic_p,
+        grid_p=grid_p,
+        gamma_min=gamma_min,
+        gamma_max=gamma_max,
+        use_clahe=use_clahe,
     )
     val_dataset.configure_cropping(enabled=False, crop_frequency=0.0)
 
@@ -195,12 +285,11 @@ def train():
     )
 
     # ---- 6) Loss, optimizer, scheduler
-    criterion = CrossEntropyWithPerClassFocal(
-        num_classes=K,
+    criterion = FocalLossCEAligned(
+        gamma=float(cfg["focal_gamma"]),
+        weight=ce_weights,
         ignore_index=int(cfg["ignore_index"]),
-        focal_gamma=float(cfg["focal_gamma"]),
-        focal_weight=float(cfg["focal_weight"]),
-        class_weights=ce_weights,
+        reduction='mean'
     )
 
     base_model = model.module if hasattr(model, "module") else model
