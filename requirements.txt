@@ -1,8 +1,6 @@
 torch --index-url https://download.pytorch.org/whl/cu128
 torchvision --index-url https://download.pytorch.org/whl/cu128
 torchaudio --index-url https://download.pytorch.org/whl/cu128
-pip install hydra-core --upgrade
-pip install -U iopath
 numpy
 matplotlib
 opencv-python
@@ -12,3 +10,9 @@ scikit-learn
 python-dotenv
 wandb
 albumentations
+
+
+# pip install hydra-core --upgrade
+# pip install -U iopath
+
+# Python 3.12.9
