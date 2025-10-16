@@ -53,6 +53,28 @@ HEALTHY_MEAN = (0.238, 0.238, 0.238)
 HEALTHY_STD = (0.168, 0.168, 0.168)
 
 
+NORMALIZATION_PRESETS: Dict[str, Tuple[Tuple[float, float, float], Tuple[float, float, float]]] = {
+    "imagenet": (IMAGENET_MEAN, IMAGENET_STD),
+    "healthy": (HEALTHY_MEAN, HEALTHY_STD),
+}
+
+
+def resolve_normalization(name: Optional[str]) -> Tuple[bool, Tuple[float, float, float], Tuple[float, float, float]]:
+    """
+    Map a normalization preset name to mean/std tuples and whether normalization should be applied.
+    """
+    if name is None:
+        return False, IMAGENET_MEAN, IMAGENET_STD
+    if isinstance(name, str):
+        key = name.strip().lower()
+        if key in ("", "none", "null"):
+            return False, IMAGENET_MEAN, IMAGENET_STD
+        if key in NORMALIZATION_PRESETS:
+            mean, std = NORMALIZATION_PRESETS[key]
+            return True, mean, std
+    raise ValueError(f"Unknown normalization preset '{name}'.")
+
+
 def freeze_image_encoder_parameters(model):
     base_model = model.module if hasattr(model, 'module') else model
     frozen = 0
@@ -99,8 +121,17 @@ class PairedImageMaskDataset(Dataset):
         pad_center: bool = False,
         norm_mean: Tuple = IMAGENET_MEAN,
         norm_std: Tuple = IMAGENET_STD,
-        apply_norm: Tuple = True,
+        apply_norm: bool = True,
         rotate_angle: int = 5,
+        bc_strength: float = 0.2,
+        noise_std: float = 0.0,
+        blur_p: float = 0.0,
+        blur_k: int = 3,
+        elastic_p: float = 0.0,
+        grid_p: float = 0.0,
+        gamma_min: float = 0.9,
+        gamma_max: float = 1.1,
+        use_clahe: bool = False,
     ) -> None:
         self.image_dir = Path(image_dir)
         self.mask_dir = Path(mask_dir)
@@ -156,7 +187,23 @@ class PairedImageMaskDataset(Dataset):
         self.num_classes = num_classes
         self.ignore_index = ignore_index
         self.augment = augment
-        self.rotate_angle = rotate_angle
+        self.rotate_angle = max(0, int(rotate_angle))
+        self.bc_strength = max(0.0, float(bc_strength))
+        self.noise_std = max(0.0, float(noise_std))
+        self.blur_p = float(max(0.0, min(1.0, blur_p)))
+        blur_kernel = int(blur_k)
+        if blur_kernel % 2 == 0:
+            blur_kernel += 1
+        if blur_kernel < 3:
+            blur_kernel = 3
+        self.blur_kernel = blur_kernel
+        self.elastic_p = float(max(0.0, min(1.0, elastic_p)))
+        self.grid_p = float(max(0.0, min(1.0, grid_p)))
+        self.gamma_min = float(gamma_min)
+        self.gamma_max = float(gamma_max)
+        if self.gamma_min <= 0 or self.gamma_max <= 0 or self.gamma_min > self.gamma_max:
+            raise ValueError("gamma_min and gamma_max must be positive with gamma_min <= gamma_max.")
+        self.use_clahe = bool(use_clahe)
         self.pad_only = pad_only
         if self.pad_only and self.ignore_index is None:
             raise ValueError("pad_only=True requires a valid ignore_index to mask padded pixels.")
@@ -187,38 +234,82 @@ class PairedImageMaskDataset(Dataset):
     def _build_augmentations(self):
         transforms = [A.HorizontalFlip(p=0.8)]
 
-        transforms.append(
-            A.Rotate(
-                limit=[-self.rotate_angle, self.rotate_angle],
-                interpolation=cv2.INTER_LINEAR,
-                border_mode=cv2.BORDER_CONSTANT,
-                rotate_method="ellipse",
-                crop_border=False,
-                mask_interpolation=cv2.INTER_NEAREST,
-                fill=0,
-                fill_mask=0,
-                p=0.8
+        if self.rotate_angle > 0:
+            transforms.append(
+                A.Rotate(
+                    limit=[-self.rotate_angle, self.rotate_angle],
+                    interpolation=cv2.INTER_LINEAR,
+                    border_mode=cv2.BORDER_CONSTANT,
+                    rotate_method="ellipse",
+                    crop_border=False,
+                    mask_interpolation=cv2.INTER_NEAREST,
+                    fill=0,
+                    fill_mask=0,
+                    p=0.8,
+                )
             )
-        )
 
-        transforms.append(
-            A.AdvancedBlur(
-                blur_limit=[3, 7],
-                sigma_x_limit=[0.2, 1],
-                sigma_y_limit=[0.2, 1],
-                rotate_limit=[-90, 90],
-                beta_limit=[0.5, 8],
-                noise_limit=[0.9, 1.1],
-                p=0.8,
+        if self.blur_p > 0.0:
+            transforms.append(
+                A.GaussianBlur(
+                    blur_limit=self.blur_kernel,
+                    sigma_limit=[0.5, 3],
+                    p=self.blur_p,
+                )
             )
-        )
+
+        if self.elastic_p > 0.0:
+            transforms.append(
+                A.ElasticTransform(
+                    alpha=1.0,
+                    sigma=50.0,
+                    border_mode=cv2.BORDER_REFLECT_101,
+                    p=self.elastic_p,
+                )
+            )
+
+        if self.grid_p > 0.0:
+            transforms.append(
+                A.GridDistortion(
+                    num_steps=5,
+                    distort_limit=0.3,
+                    border_mode=cv2.BORDER_REFLECT_101,
+                    p=self.grid_p,
+                )
+            )
+
+        if self.noise_std > 0.0:
+            transforms.append(
+                A.GaussNoise(
+                    std_range=[0.0, self.noise_std],
+                    mean_range=[0,0],
+                    per_channel=False,
+                    p=0.5,
+                )
+            )
+
+        if self.use_clahe:
+            transforms.append(A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.5))
+
+        if self.bc_strength > 0.0:
+            lower = max(0.0, 1.0 - self.bc_strength)
+            upper = 1.0 + self.bc_strength
+            transforms.append(
+                A.ColorJitter(
+                    brightness=[lower, upper],
+                    contrast=[lower, upper],
+                    saturation=[lower, upper],
+                    hue=[-self.bc_strength, self.bc_strength],
+                    p=0.8,
+                )
+            )
+
+        gamma_min_int = max(1, int(round(self.gamma_min * 100)))
+        gamma_max_int = max(gamma_min_int, int(round(self.gamma_max * 100)))
         transforms.append(
-            A.ColorJitter(
-                brightness=[0.8, 1.2],
-                contrast=[0.8, 1.2],
-                saturation=[0.8, 1.2],
-                hue=[-0.5, 0.5],
-                p=0.8,
+            A.RandomGamma(
+                gamma_limit=(gamma_min_int, gamma_max_int),
+                p=0.5,
             )
         )
 
@@ -853,10 +944,10 @@ def save_checkpoint(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fine-tune Semantic SAM2 on paired image/mask datasets.")
-    parser.add_argument("--train-images", type=Path, default=Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\train\img_stretched"), help="Directory with training images.")
-    parser.add_argument("--train-masks", type=Path, default=Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\train\mask_stretched"), help="Directory with training masks.")
-    parser.add_argument("--val-images", type=Path, default=Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\val\img_stretched"), help="Directory with validation images.")
-    parser.add_argument("--val-masks", type=Path, default=Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\val\mask_stretched"), help="Directory with validation masks.")
+    parser.add_argument("--train-images", type=Path, default=Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\train\img_unchanged"), help="Directory with training images.")
+    parser.add_argument("--train-masks", type=Path, default=Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\train\mask_unchanged"), help="Directory with training masks.")
+    parser.add_argument("--val-images", type=Path, default=Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\val\img_unchanged"), help="Directory with validation images.")
+    parser.add_argument("--val-masks", type=Path, default=Path(r"D:\GitHub\segment_anything_private\processed_data\Healthy\val\mask_unchanged"), help="Directory with validation masks.")
     parser.add_argument("--config-file", type=str, default="configs/sam2.1/sam2.1_hiera_b+.yaml", help="Hydra config name for the backbone (e.g. configs/sam2.1/sam2.1_hiera_b+.yaml).")
     # parser.add_argument("--checkpoint", type=str, default=root_dir/"checkpoints/sam2.1_hiera_base_plus.pt", help="Optional checkpoint path to initialize the model.")
     parser.add_argument("--checkpoint", type=str, default=root_dir/"semantic_sam2/training_checkpoints/FIE_best.pt", help="Optional checkpoint path to initialize the model.")
@@ -876,13 +967,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("semantic_sam2_runs"), help="Directory to store checkpoints.")
     parser.add_argument("--ignore-index", type=int, default=-1, help="Ignore index value used in the masks.")
     parser.add_argument("--augment", default=True, action="store_true", help="Enable simple flip augmentations.")
-    parser.add_argument("--pad-only", default=False, action="store_true", help="Zero-pad inputs to image_size instead of resizing.")
-    parser.add_argument("--center-pad", default=False, action="store_true", help="Center content when using pad-only mode.")
+    parser.add_argument("--aug-rot-angle", type=int, default=5, help="Maximum absolute rotation angle (degrees) applied when augmentation is enabled.")
+    parser.add_argument("--img-normalization", type=str, choices=["none", "imagenet", "healthy"], default="imagenet", help="Normalization preset applied to input images ('none' disables normalization).")
+    parser.add_argument("--bc-strength", type=float, default=0.2, help="Brightness/contrast jitter strength (0 disables).")
+    parser.add_argument("--noise-std", type=float, default=0.0, help="Standard deviation for Gaussian noise as a fraction of 255 (0 disables).")
+    parser.add_argument("--blur-p", type=float, default=0.0, help="Probability of applying Gaussian blur (0 disables).")
+    parser.add_argument("--blur-k", type=int, default=3, help="Kernel size for Gaussian blur (odd integer >=3).")
+    parser.add_argument("--elastic-p", type=float, default=0.0, help="Probability of applying elastic deformation (0 disables).")
+    parser.add_argument("--grid-p", type=float, default=0.0, help="Probability of applying grid distortion (0 disables).")
+    parser.add_argument("--gamma-min", type=float, default=0.9, help="Lower bound for random gamma adjustment.")
+    parser.add_argument("--gamma-max", type=float, default=1.1, help="Upper bound for random gamma adjustment.")
+    parser.add_argument("--use-clahe", type=int, choices=[0, 1], default=0, help="Apply CLAHE (1) or skip (0).")
+    parser.add_argument("--pad-only", default=True, action="store_true", help="Zero-pad inputs to image_size instead of resizing.")
+    parser.add_argument("--center-pad", default=True, action="store_true", help="Center content when using pad-only mode.")
     parser.add_argument("--focal-gamma", type=float, default=3.0, help="Gamma parameter for the focal loss component.")
-    parser.add_argument("--focal-weight", type=float, default=1.0, help="Weight applied to the focal component alongside cross-entropy.")
     parser.add_argument("--ce-class-weights", type=str, default="1,1,1,1.3,1,1,1,1.3,1", help="Comma-separated list of class weights applied to the cross-entropy term.")
-    parser.add_argument("--enable-cropping", default=True, action="store_true", help="Enable class-focused cropping augmentation.")
-    parser.add_argument("--crop-frequency", type=float, default=0.5, help="Probability of applying a focused crop to a sample when cropping is enabled.")
+    parser.add_argument("--enable-cropping", default=False, action="store_true", help="Enable class-focused cropping augmentation.")
+    parser.add_argument("--crop-frequency", type=float, default=0.0, help="Probability of applying a focused crop to a sample when cropping is enabled.")
     parser.add_argument("--crop-target-classes", type=str, default=None, help="Comma-separated list of target classes to bias cropping towards (defaults to middle class).")
     parser.add_argument("--crop-min-margin", type=int, default=123, help="Minimum distance from image border for crop seed points.")
     parser.add_argument("--crop-min-size", type=int, default=256, help="Minimum crop edge length before resizing to the model input size.")
@@ -902,6 +1003,17 @@ def main() -> None:
     set_seed(args.seed, deterministic=args.deterministic)
     if args.center_pad and not args.pad_only:
         raise SystemExit("--center-pad requires --pad-only to be set.")
+
+    try:
+        apply_norm, norm_mean, norm_std = resolve_normalization(args.img_normalization)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    if args.gamma_min <= 0 or args.gamma_max <= 0:
+        raise SystemExit("--gamma-min and --gamma-max must be positive.")
+    if args.gamma_min > args.gamma_max:
+        raise SystemExit("--gamma-min must be <= --gamma-max.")
+    use_clahe = bool(args.use_clahe)
 
     ce_class_weights: Optional[torch.Tensor] = None
     if args.ce_class_weights:
@@ -986,18 +1098,35 @@ def main() -> None:
         num_classes=args.num_classes,
         ignore_index=args.ignore_index,
         augment=args.augment,
+        norm_mean=norm_mean,
+        norm_std=norm_std,
+        apply_norm=apply_norm,
+        rotate_angle=args.aug_rot_angle,
+        bc_strength=args.bc_strength,
+        noise_std=args.noise_std,
+        blur_p=args.blur_p,
+        blur_k=args.blur_k,
+        elastic_p=args.elastic_p,
+        grid_p=args.grid_p,
+        gamma_min=args.gamma_min,
+        gamma_max=args.gamma_max,
+        use_clahe=use_clahe,
         pad_only=args.pad_only,
         pad_center=args.center_pad,
     )
+    # train_dataset.configure_cropping(
+    #     enabled=args.enable_cropping,
+    #     crop_frequency=args.crop_frequency,
+    #     target_classes=crop_target_classes,
+    #     background_class=0,
+    #     min_margin=args.crop_min_margin,
+    #     min_crop=args.crop_min_size,
+    #     extra_margin=args.crop_extra_margin,
+    #     extra_down=args.crop_extra_down,
+    # )
     train_dataset.configure_cropping(
-        enabled=args.enable_cropping,
-        crop_frequency=args.crop_frequency,
-        target_classes=crop_target_classes,
-        background_class=0,
-        min_margin=args.crop_min_margin,
-        min_crop=args.crop_min_size,
-        extra_margin=args.crop_extra_margin,
-        extra_down=args.crop_extra_down,
+        enabled=False,
+        crop_frequency=0.0,
     )
     val_dataset = PairedImageMaskDataset(
         image_dir=args.val_images,
@@ -1006,6 +1135,19 @@ def main() -> None:
         num_classes=args.num_classes,
         ignore_index=args.ignore_index,
         augment=False,
+        norm_mean=norm_mean,
+        norm_std=norm_std,
+        apply_norm=apply_norm,
+        rotate_angle=args.aug_rot_angle,
+        bc_strength=args.bc_strength,
+        noise_std=args.noise_std,
+        blur_p=args.blur_p,
+        blur_k=args.blur_k,
+        elastic_p=args.elastic_p,
+        grid_p=args.grid_p,
+        gamma_min=args.gamma_min,
+        gamma_max=args.gamma_max,
+        use_clahe=use_clahe,
         pad_only=args.pad_only,
         pad_center=args.center_pad,
     )
@@ -1102,7 +1244,6 @@ def main() -> None:
             "val_images": str(args.val_images),
             "val_masks": str(args.val_masks),
             "focal_gamma": args.focal_gamma,
-            "focal_weight": args.focal_weight,
             "ce_class_weights": args.ce_class_weights,
             "enable_cropping": args.enable_cropping,
             "crop_frequency": args.crop_frequency,
